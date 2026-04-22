@@ -193,7 +193,7 @@ app.post('/api/create-checkout', async (req, res) => {
         quantity: 1,
       }],
       metadata: { treatment, duration, date: date || '', time: time || '', patient_name, patient_email, patient_phone, notes, price: String(price) },
-      success_url: clinicWebsite + '/booking-success?session_id={CHECKOUT_SESSION_ID}',
+              success_url: clinicWebsite + '/?booking=confirmed',
       cancel_url: clinicWebsite + '/booking-cancelled',
     });
 
