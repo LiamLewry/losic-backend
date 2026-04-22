@@ -269,5 +269,30 @@ app.post('/api/stripe-webhook', async (req, res) => {
 if (require.main === module) {
   app.listen(PORT, () => console.log('LOSIC backend running on port ' + PORT));
 }
+app.post('/api/create-checkout', async (req, res) => {
+    try {
+          const { treatment, duration, price, date, time, patient_name, patient_email, patient_phone, notes } = req.body;
+          if (!price) return res.status(400).json({ error: 'price is required' });
+          if (!treatment) return res.status(400).json({ error: 'treatment is required' });
+          const session = await stripe.checkout.sessions.create({
+                  payment_method_types: ['card'],
+                  line_items: [{ price_data: { currency: 'gbp', product_data: { name: treatment + (duration ? ' - ' + duration : '') }, unit_amount: Math.round(Number(price) * 100) }, quantity: 1 }],
+                  mode: 'payment',
+                  customer_email: patient_email || undefined,
+                  success_url: 'https://losic.co.uk/?booking=confirmed',
+                  cancel_url: 'https://losic.co.uk/appointments/',
+                  metadata: { treatment: treatment||'', duration: duration||'', price: String(price), appointment_date: date||'', appointment_time: time||'', patient_name: patient_name||'', patient_email: patient_email||'', patient_phone: patient_phone||'', notes: notes||'' },
+          });
+          res.json({ checkout_url: session.url, session_id: session.id });
+    } catch (err) { console.error('Checkout error:', err.message); res.status(500).json({ error: err.message }); }
+});
+app.get('/api/check-session', async (req, res) => {
+    try {
+          const { session_id } = req.query;
+          if (!session_id) return res.status(400).json({ error: 'session_id is required' });
+          const session = await stripe.checkout.sessions.retrieve(session_id);
+          res.json({ paid: session.payment_status === 'paid' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 module.exports = app;
