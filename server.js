@@ -51,7 +51,7 @@ async function findOrCreatePatient(name, email, phone) {
   const searchData = await searchResp.json();
   if (searchData.patients && searchData.patients.length > 0) return searchData.patients[0].id;
 
-  const nameParts = name.trim().split(' ');
+  conboarding@resend.devonst nameParts = name.trim().split(' ');
   const firstName = nameParts[0] || 'Unknown';
   const lastName = nameParts.slice(1).join(' ') || '-';
 
@@ -79,7 +79,7 @@ async function sendConfirmationEmails({ patientName, patientEmail, treatment, du
 
   const clinicName = process.env.CLINIC_NAME || 'LOSIC';
   const clinicEmail = process.env.CLINIC_EMAIL || 'info@losic.co.uk';
-  const fromAddress = clinicName + ' <bookings@losic.co.uk>';
+    const fromAddress = 'LOSIC <onboarding@resend.dev>';
 
   const patientHtml = '<!DOCTYPE html><html><body style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111827;">' +
     '<h2 style="color:#7c3aed;">Booking Confirmed</h2>' +
