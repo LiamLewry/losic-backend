@@ -58,7 +58,10 @@ app.use(express.json());
 // ============================================
 // Prevents casual Stripe-charge abuse from a single IP.
 // Best-effort only — in-memory state resets on Vercel cold starts.
+// For real abuse protection at scale, point REDIS_URL at Upstash and
+// swap this for a redis-backed limiter (TODO).
 const _rateBuckets = new Map();
+const _rateBucketCap = 5_000; // cap map size so a botnet can't OOM us
 function rateLimit({ windowMs = 60_000, max = 5 } = {}) {
     return (req, res, next) => {
         const ip =
@@ -66,6 +69,16 @@ function rateLimit({ windowMs = 60_000, max = 5 } = {}) {
             req.socket?.remoteAddress ||
             'unknown';
         const now = Date.now();
+
+        // Lazy GC: when the map gets oversized, drop everything that's
+        // already past its window. Cheap and good enough for a single
+        // serverless instance.
+        if (_rateBuckets.size > _rateBucketCap) {
+            for (const [k, v] of _rateBuckets) {
+                if (now > v.resetAt) _rateBuckets.delete(k);
+            }
+        }
+
         const bucket = _rateBuckets.get(ip);
         if (!bucket || now > bucket.resetAt) {
             _rateBuckets.set(ip, { count: 1, resetAt: now + windowMs });
@@ -240,7 +253,67 @@ async function createClinikoAppointmentFromSession(session) {
         return appt;
     } catch (err) {
         console.error('Cliniko appointment creation failed:', err.message);
-        // Don't throw — payment already succeeded, log and continue
+        // Payment already succeeded — don't throw, but escalate so the
+        // booking doesn't silently disappear. The clinic gets an alert
+        // email with the patient details so they can add it manually.
+        await sendClinicAlert({
+            subject: `⚠ MANUAL BOOKING NEEDED — ${patient_name} (${treatment})`,
+            reason: 'Cliniko appointment creation failed after a successful payment.',
+            error: err.message,
+            session,
+        }).catch((alertErr) => {
+            console.error('Cliniko-failure alert email also failed:', alertErr.message);
+        });
+    }
+}
+
+// ============================================
+// CLINIC ALERT EMAIL (failure escalation)
+// ============================================
+// Sends a high-priority email to the clinic inbox when something has
+// gone wrong AFTER payment succeeded — so a paid booking can't silently
+// fall on the floor. Uses Resend (already wired) so no new dep.
+async function sendClinicAlert({ subject, reason, error, session }) {
+    const key = process.env.RESEND_API_KEY;
+    if (!key || key === 're_your_resend_api_key_here') {
+        console.warn('RESEND_API_KEY not set — cannot send clinic alert');
+        return;
+    }
+    const clinicInbox = process.env.CLINIC_EMAIL || 'lutonosteo@gmail.com';
+    const from = process.env.RESEND_FROM || 'LOSIC Bookings <bookings@losic.co.uk>';
+    const m = (session && session.metadata) || {};
+    const html = `
+<div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px;border:2px solid #dc2626;border-radius:12px;background:#fef2f2;">
+  <h2 style="color:#dc2626;margin:0 0 8px;">⚠ Action required</h2>
+  <p style="color:#7f1d1d;margin:0 0 16px;font-weight:600;">${escapeHtml(reason)}</p>
+  <p style="color:#7f1d1d;margin:0 0 20px;">A patient has paid in Stripe but the booking did not land in Cliniko automatically. Please add it manually.</p>
+  <div style="background:#fff;border-radius:8px;padding:16px;margin:16px 0;">
+    <table style="width:100%;border-collapse:collapse;font-size:14px;">
+      <tr><td style="padding:6px 0;color:#6b7280;width:40%;">Patient</td><td style="padding:6px 0;font-weight:600;">${escapeHtml(m.patient_name || '—')}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Email</td><td style="padding:6px 0;">${escapeHtml(m.patient_email || (session && session.customer_email) || '—')}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Phone</td><td style="padding:6px 0;">${escapeHtml(m.patient_phone || '—')}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Treatment</td><td style="padding:6px 0;font-weight:600;">${escapeHtml(m.treatment || '—')}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Duration</td><td style="padding:6px 0;">${escapeHtml(m.duration || '—')}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Date</td><td style="padding:6px 0;font-weight:600;">${escapeHtml(m.appointment_date || '—')}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Time</td><td style="padding:6px 0;font-weight:600;">${escapeHtml(m.appointment_time || '—')}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Paid</td><td style="padding:6px 0;font-weight:600;">£${escapeHtml(m.price || '0')}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Booking Ref</td><td style="padding:6px 0;">${escapeHtml(m.booking_ref || '—')}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Stripe Session</td><td style="padding:6px 0;font-family:monospace;font-size:11px;">${escapeHtml((session && session.id) || '—')}</td></tr>
+      ${m.notes ? `<tr><td style="padding:6px 0;color:#6b7280;">Notes</td><td style="padding:6px 0;">${escapeHtml(m.notes)}</td></tr>` : ''}
+    </table>
+  </div>
+  <p style="color:#7f1d1d;margin:16px 0 0;font-size:12px;"><strong>Underlying error:</strong> ${escapeHtml(error || 'unknown')}</p>
+</div>`;
+
+    const r = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from, to: [clinicInbox], subject, html }),
+    });
+    if (!r.ok) {
+        console.error('Clinic alert email failed:', await r.text());
+    } else {
+        console.log(`Clinic alert email sent → ${maskEmail(clinicInbox)}`);
     }
 }
 
