@@ -671,9 +671,21 @@ app.get('/api/available-times', async (req, res) => {
 // ============================================
 
 app.get('/api/config', (req, res) => {
+    // Lightweight integration health flags — booleans only, never the
+    // actual keys. Useful to confirm what's wired in production
+    // without having to grep Vercel env vars.
+    const isReal = (v) => Boolean(v && !String(v).includes('your_') && !String(v).includes('placeholder'));
     res.json({
         stripePublishableKey: process.env.STRIPE_PUBLISHABLE_KEY,
         clinicName: process.env.CLINIC_NAME || 'LOSIC',
+        integrations: {
+            stripe:  isReal(process.env.STRIPE_SECRET_KEY),
+            stripeWebhook: isReal(process.env.STRIPE_WEBHOOK_SECRET),
+            cliniko: isReal(process.env.CLINIKO_API_KEY),
+            resend:  isReal(process.env.RESEND_API_KEY),
+            resendFromConfigured: Boolean(process.env.RESEND_FROM),
+            clinicEmailConfigured: Boolean(process.env.CLINIC_EMAIL),
+        },
     });
 });
 
