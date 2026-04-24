@@ -88,6 +88,50 @@ function clampStr(v, max) {
     return s.length > max ? s.slice(0, max) : s;
 }
 
+// HTML-escape every patient-controlled field before it goes into an
+// email template. Without this, a patient called `<script>...</script>`
+// or notes containing markup would inject HTML into our outbound emails.
+function escapeHtml(v) {
+    if (v == null) return '';
+    return String(v)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// Reject prices that aren't a sensible positive GBP amount.
+// Cliniko/Stripe both choke (or worse, accept) on NaN/Infinity/negatives.
+function isValidPrice(p) {
+    const n = Number(p);
+    return Number.isFinite(n) && n > 0 && n < 10_000;
+}
+
+// YYYY-MM-DD format guard for query params we forward to Cliniko.
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// Numeric ID guard for Cliniko query params (appointment_type_id,
+// practitioner_id) — prevents arbitrary string injection into the URL.
+const NUMERIC_ID_RE = /^\d{1,12}$/;
+
+// Mask an email for logs so we can correlate without writing PII.
+function maskEmail(e) {
+    if (!e || typeof e !== 'string' || !e.includes('@')) return '<no-email>';
+    const [user, domain] = e.split('@');
+    const u = user.length <= 2 ? user[0] + '*' : user[0] + '***' + user.slice(-1);
+    return `${u}@${domain}`;
+}
+
+// Send a safe 500 to the client (never leak Stripe/Cliniko internals or
+// stack traces) while still logging the full error for ourselves.
+function safeError(res, where, err, status = 500) {
+    console.error(`${where}:`, err?.message || err);
+    res.status(status).json({
+        error: 'The booking service had a problem. Please try again, or call the clinic.',
+    });
+}
+
 // ============================================
 // CLINIKO HELPER
 // ============================================
@@ -170,11 +214,11 @@ async function createClinikoAppointmentFromSession(session) {
         patient_email,
     } = session.metadata || {};
 
-    console.log('Creating Cliniko appointment for:', patient_name, treatment, appointment_date, appointment_time);
+    console.log(`Creating Cliniko appointment | ${treatment} | ${appointment_date} ${appointment_time}`);
 
     try {
         const patient = await findOrCreatePatient(patient_name, patient_email || session.customer_email, patient_phone);
-        console.log('Patient ready:', patient.id);
+        console.log(`Patient ready: id=${patient.id}`);
 
         if (!appointment_date || !appointment_time) {
             console.warn('No date/time in metadata — skipping Cliniko appointment creation');
@@ -211,53 +255,65 @@ async function sendConfirmationEmails({ name, email, treatment, duration, price,
         return;
     }
 
-    const displayName = name || 'Patient';
+    // Every interpolated field is HTML-escaped because patient_name and
+    // notes are user-controlled (Stripe metadata is just a string store —
+    // no schema validation on what we put in).
+    const safeName     = escapeHtml(name || 'Patient');
+    const safeEmail    = escapeHtml(email);
+    const safeTreatmt  = escapeHtml(treatment || 'N/A');
+    const safeDuration = escapeHtml(duration || 'N/A');
+    const safeTime     = escapeHtml(time || 'TBC');
+    const safePrice    = escapeHtml(price != null ? String(price) : '0');
+    const safeNotes    = notes ? escapeHtml(notes) : '';
+    const safeRef      = bookingRef ? escapeHtml(bookingRef) : '';
     const formattedDate = date
         ? new Date(date).toLocaleDateString('en-GB', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
         : 'TBC';
 
+    // Brand teal colours (match the Flutter AppColors palette):
+    //   #248B9A primary, #ECF3F4 pale, #45B5C6 light, #175A64 dark.
     const patientHtml = `
 <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px;">
-  <h1 style="color:#7c3aed;margin:0 0 4px;">LOSIC Clinic</h1>
+  <h1 style="color:#248B9A;margin:0 0 4px;">LOSIC Clinic</h1>
   <p style="color:#6b7280;margin:0 0 20px;">Luton Osteopathic &amp; Sports Injury Clinic</p>
   <h2 style="color:#111827;">Booking Confirmed ✓</h2>
-  <p>Dear ${displayName},</p>
+  <p>Dear ${safeName},</p>
   <p>Thank you for booking with LOSIC. Your appointment is confirmed and payment has been received.</p>
-  ${bookingRef ? `<div style="background:#ede9fe;border:1px solid #c4b5fd;border-radius:8px;padding:12px 16px;margin:16px 0;text-align:center;">
+  ${safeRef ? `<div style="background:#ECF3F4;border:1px solid #45B5C6;border-radius:8px;padding:12px 16px;margin:16px 0;text-align:center;">
     <div style="font-size:12px;color:#6b7280;">Booking Reference</div>
-    <div style="font-size:18px;font-weight:700;color:#7c3aed;letter-spacing:1.5px;margin-top:2px;">${bookingRef}</div>
+    <div style="font-size:18px;font-weight:700;color:#248B9A;letter-spacing:1.5px;margin-top:2px;">${safeRef}</div>
   </div>` : ''}
   <div style="background:#f9fafb;border-radius:8px;padding:16px;margin:20px 0;">
     <table style="width:100%;border-collapse:collapse;">
-      <tr><td style="padding:8px 0;color:#6b7280;width:40%;">Treatment</td><td style="padding:8px 0;font-weight:600;">${treatment || 'N/A'}</td></tr>
-      <tr><td style="padding:8px 0;color:#6b7280;">Duration</td><td style="padding:8px 0;font-weight:600;">${duration || 'N/A'}</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280;width:40%;">Treatment</td><td style="padding:8px 0;font-weight:600;">${safeTreatmt}</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280;">Duration</td><td style="padding:8px 0;font-weight:600;">${safeDuration}</td></tr>
       <tr><td style="padding:8px 0;color:#6b7280;">Date</td><td style="padding:8px 0;font-weight:600;">${formattedDate}</td></tr>
-      <tr><td style="padding:8px 0;color:#6b7280;">Time</td><td style="padding:8px 0;font-weight:600;">${time || 'TBC'}</td></tr>
-      <tr><td style="padding:8px 0;color:#6b7280;">Amount Paid</td><td style="padding:8px 0;font-weight:600;color:#7c3aed;">£${price || '0'}</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280;">Time</td><td style="padding:8px 0;font-weight:600;">${safeTime}</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280;">Amount Paid</td><td style="padding:8px 0;font-weight:600;color:#248B9A;">£${safePrice}</td></tr>
     </table>
   </div>
-  ${notes ? `<p style="color:#6b7280;font-size:14px;"><strong>Notes:</strong> ${notes}</p>` : ''}
-  <div style="background:#ede9fe;border-radius:8px;padding:16px;margin:20px 0;">
-    <p style="margin:0;font-size:14px;color:#7c3aed;">📍 577 Dunstable Road, Luton, Bedfordshire, LU4 8QW</p>
-    <p style="margin:8px 0 0;font-size:14px;color:#7c3aed;">⏰ Please arrive 10 minutes early</p>
-    <p style="margin:8px 0 0;font-size:14px;color:#7c3aed;">❌ Free cancellation up to 24 hours before</p>
+  ${safeNotes ? `<p style="color:#6b7280;font-size:14px;"><strong>Notes:</strong> ${safeNotes}</p>` : ''}
+  <div style="background:#ECF3F4;border-radius:8px;padding:16px;margin:20px 0;">
+    <p style="margin:0;font-size:14px;color:#175A64;">📍 577 Dunstable Road, Luton, Bedfordshire, LU4 8QW</p>
+    <p style="margin:8px 0 0;font-size:14px;color:#175A64;">⏰ Please arrive 10 minutes early</p>
+    <p style="margin:8px 0 0;font-size:14px;color:#175A64;">❌ Free cancellation up to 24 hours before</p>
   </div>
   <p style="color:#6b7280;font-size:14px;">Questions? <a href="mailto:lutonosteo@gmail.com">lutonosteo@gmail.com</a> or <a href="tel:01582575045">01582 575 045</a></p>
 </div>`;
 
     const clinicHtml = `
 <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px;">
-  <h2 style="color:#7c3aed;">New Booking — Payment Received</h2>
+  <h2 style="color:#248B9A;">New Booking — Payment Received</h2>
   <table style="width:100%;border-collapse:collapse;">
-    ${bookingRef ? `<tr><td style="padding:8px 0;color:#6b7280;width:40%;">Ref</td><td style="padding:8px 0;font-weight:700;color:#7c3aed;letter-spacing:1px;">${bookingRef}</td></tr>` : ''}
-    <tr><td style="padding:8px 0;color:#6b7280;width:40%;">Patient</td><td style="padding:8px 0;font-weight:600;">${displayName}</td></tr>
-    <tr><td style="padding:8px 0;color:#6b7280;">Email</td><td style="padding:8px 0;">${email || '—'}</td></tr>
-    <tr><td style="padding:8px 0;color:#6b7280;">Treatment</td><td style="padding:8px 0;font-weight:600;">${treatment || 'N/A'}</td></tr>
-    <tr><td style="padding:8px 0;color:#6b7280;">Duration</td><td style="padding:8px 0;font-weight:600;">${duration || 'N/A'}</td></tr>
+    ${safeRef ? `<tr><td style="padding:8px 0;color:#6b7280;width:40%;">Ref</td><td style="padding:8px 0;font-weight:700;color:#248B9A;letter-spacing:1px;">${safeRef}</td></tr>` : ''}
+    <tr><td style="padding:8px 0;color:#6b7280;width:40%;">Patient</td><td style="padding:8px 0;font-weight:600;">${safeName}</td></tr>
+    <tr><td style="padding:8px 0;color:#6b7280;">Email</td><td style="padding:8px 0;">${safeEmail || '—'}</td></tr>
+    <tr><td style="padding:8px 0;color:#6b7280;">Treatment</td><td style="padding:8px 0;font-weight:600;">${safeTreatmt}</td></tr>
+    <tr><td style="padding:8px 0;color:#6b7280;">Duration</td><td style="padding:8px 0;font-weight:600;">${safeDuration}</td></tr>
     <tr><td style="padding:8px 0;color:#6b7280;">Date</td><td style="padding:8px 0;font-weight:600;">${formattedDate}</td></tr>
-    <tr><td style="padding:8px 0;color:#6b7280;">Time</td><td style="padding:8px 0;font-weight:600;">${time || 'TBC'}</td></tr>
-    <tr><td style="padding:8px 0;color:#6b7280;">Paid</td><td style="padding:8px 0;font-weight:600;color:#7c3aed;">£${price || '0'}</td></tr>
-    ${notes ? `<tr><td style="padding:8px 0;color:#6b7280;">Notes</td><td style="padding:8px 0;">${notes}</td></tr>` : ''}
+    <tr><td style="padding:8px 0;color:#6b7280;">Time</td><td style="padding:8px 0;font-weight:600;">${safeTime}</td></tr>
+    <tr><td style="padding:8px 0;color:#6b7280;">Paid</td><td style="padding:8px 0;font-weight:600;color:#248B9A;">£${safePrice}</td></tr>
+    ${safeNotes ? `<tr><td style="padding:8px 0;color:#6b7280;">Notes</td><td style="padding:8px 0;">${safeNotes}</td></tr>` : ''}
   </table>
 </div>`;
 
@@ -274,8 +330,18 @@ async function sendConfirmationEmails({ name, email, treatment, duration, price,
         if (!r.ok) console.error(`Email to ${to} failed:`, await r.text());
     };
 
-    // Clinic notification email — goes to the live clinic inbox.
-    const clinicInbox = process.env.CLINIC_EMAIL || 'lutonosteo@gmail.com';
+    // Clinic notification email — goes to the live clinic inbox. The
+    // hardcoded fallback is a safety net so emails don't silently
+    // disappear, but it's a personal address — make the fallback loud
+    // in logs so misconfiguration is caught quickly.
+    let clinicInbox = process.env.CLINIC_EMAIL;
+    if (!clinicInbox) {
+        clinicInbox = 'lutonosteo@gmail.com';
+        console.warn(
+            'CLINIC_EMAIL env var not set — falling back to lutonosteo@gmail.com. ' +
+            'Set CLINIC_EMAIL in Vercel to silence this warning.'
+        );
+    }
 
     await Promise.allSettled([
         email ? send(email, 'Your LOSIC Booking Confirmation', patientHtml) : Promise.resolve(),
@@ -296,7 +362,9 @@ app.post('/api/stripe-webhook', async (req, res) => {
         event = stripe.webhooks.constructEvent(req.body, sig, secret);
     } catch (err) {
         console.error('Webhook signature error:', err.message);
-        return res.status(400).send(`Webhook Error: ${err.message}`);
+        // Stripe sees the 400 and retries; we don't echo the error
+        // back over the wire because the body is internet-visible.
+        return res.status(400).send('Webhook signature verification failed');
     }
 
     if (event.type === 'checkout.session.completed') {
@@ -341,6 +409,9 @@ app.post('/api/create-checkout', rateLimit({ windowMs: 60_000, max: 5 }), async 
         } = req.body;
 
         if (!price) return res.status(400).json({ error: 'price is required' });
+        if (!isValidPrice(price)) {
+            return res.status(400).json({ error: 'price must be a positive number under £10,000' });
+        }
         if (!treatment) return res.status(400).json({ error: 'treatment is required' });
 
         // Cap each metadata field so nobody can stuff garbage into Stripe.
@@ -400,12 +471,14 @@ app.post('/api/create-checkout', rateLimit({ windowMs: 60_000, max: 5 }), async 
             },
         });
 
-        console.log(`Checkout session created: ${session.id} for ${m_patient_name} — ${m_treatment} £${price}`);
+        // Mask PII in logs — email gets partial masking, name dropped.
+        // Vercel logs are visible to anyone with project access, and
+        // we don't want patient identifiers sitting there in plaintext.
+        console.log(`Checkout session ${session.id} | ${m_treatment} £${price} | ${maskEmail(m_patient_email)}`);
         res.json({ checkout_url: session.url, session_id: session.id });
 
     } catch (error) {
-        console.error('Checkout error:', error.message);
-        res.status(500).json({ error: error.message });
+        return safeError(res, 'create-checkout', error);
     }
 });
 
@@ -417,13 +490,17 @@ async function _checkSessionHandler(req, res) {
     try {
         const { session_id } = req.query;
         if (!session_id) return res.status(400).json({ error: 'session_id is required' });
+        // Stripe session IDs look like `cs_test_a1...` or `cs_live_...`.
+        // Reject anything that doesn't match before hitting Stripe.
+        if (!/^cs_(test|live)_[A-Za-z0-9]{1,200}$/.test(String(session_id))) {
+            return res.status(400).json({ error: 'session_id is not a valid Stripe checkout id' });
+        }
 
         const session = await stripe.checkout.sessions.retrieve(session_id);
         const paid = session.payment_status === 'paid';
         res.json({ paid, status: session.payment_status });
     } catch (error) {
-        console.error('Check session error:', error.message);
-        res.status(500).json({ error: error.message });
+        return safeError(res, 'check-session', error);
     }
 }
 app.get('/api/check-session',  _checkSessionHandler);
@@ -452,6 +529,9 @@ app.get('/api/booked-slots', async (req, res) => {
     try {
         const { date } = req.query;
         if (!date) return res.status(400).json({ error: 'date is required (YYYY-MM-DD)' });
+        if (!DATE_RE.test(String(date))) {
+            return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+        }
         const from = `${date}T00:00:00`;
         const to   = `${date}T23:59:59`;
         const endpoint =
@@ -480,7 +560,7 @@ app.get('/api/appointment-types', async (req, res) => {
         const data = await clinikoFetch('/appointment_types');
         res.json(data.appointment_types || []);
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        return safeError(res, 'appointment-types', error);
     }
 });
 
@@ -492,6 +572,15 @@ app.get('/api/available-times', async (req, res) => {
     try {
         const { date, appointment_type_id, practitioner_id } = req.query;
         if (!date) return res.status(400).json({ error: 'date is required' });
+        if (!DATE_RE.test(String(date))) {
+            return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+        }
+        if (appointment_type_id && !NUMERIC_ID_RE.test(String(appointment_type_id))) {
+            return res.status(400).json({ error: 'appointment_type_id must be numeric' });
+        }
+        if (practitioner_id && !NUMERIC_ID_RE.test(String(practitioner_id))) {
+            return res.status(400).json({ error: 'practitioner_id must be numeric' });
+        }
 
         let endpoint = `/available_times?from=${date}&to=${date}`;
         if (appointment_type_id) endpoint += `&appointment_type_id=${appointment_type_id}`;
@@ -500,7 +589,7 @@ app.get('/api/available-times', async (req, res) => {
         const data = await clinikoFetch(endpoint);
         res.json(data.available_times || []);
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        return safeError(res, 'available-times', error);
     }
 });
 
@@ -520,13 +609,12 @@ app.get('/api/config', (req, res) => {
 // ============================================
 
 app.get('/api/practitioners', async (req, res) => {
-        try {
-                    const data = await clinikoFetch('/practitioners');
-                    res.json(data.practitioners || []);
-        } catch (error) {
-                    console.error('Error fetching practitioners:', error);
-                    res.status(500).json({ error: error.message });
-        }
+    try {
+        const data = await clinikoFetch('/practitioners');
+        res.json(data.practitioners || []);
+    } catch (error) {
+        return safeError(res, 'practitioners', error);
+    }
 });
 
 // ============================================
