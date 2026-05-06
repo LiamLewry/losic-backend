@@ -126,7 +126,36 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 // Numeric ID guard for Cliniko query params (appointment_type_id,
 // practitioner_id) — prevents arbitrary string injection into the URL.
-const NUMERIC_ID_RE = /^\d{1,12}$/;
+// Cliniko IDs are 64-bit ints rendered as up to 19 digits, so the regex
+// has to allow that full range; trimming to 12 silently rejected real
+// IDs from /api/booked-slots.
+const NUMERIC_ID_RE = /^\d{1,20}$/;
+
+// LOSIC-specific Cliniko IDs. Captured from the live /api/cliniko-businesses
+// endpoint and the practitioner list in lib/config/cliniko_mapping.dart on
+// 29 Apr 2026. Both are 64-bit integers — see buildClinikoApptBody for why
+// they're stored as strings rather than JS numbers.
+const LOSIC_BUSINESS_ID    = '447416504502195880'; // Luton Osteopathic & Sports Injury Clinic Ltd
+const LOSIC_PRACTITIONER_ID = '447416501566182462'; // David Leach (head osteopath)
+
+// Build a Cliniko `/individual_appointments` POST body without ever
+// running the 64-bit IDs through JS Number — values over 2^53 lose
+// precision, which would make Cliniko reject the request as "no such
+// appointment_type". Each ID is embedded as a raw JSON numeric literal
+// straight from a string. Notes/start_time go through JSON.stringify so
+// quotes and unicode escape correctly.
+function buildClinikoApptBody({ apptStart, patientId, apptTypeId, businessId, practitionerId, notes }) {
+    const safeStart = JSON.stringify(String(apptStart));
+    const safeNotes = JSON.stringify(String(notes || ''));
+    return '{' +
+        `"appointment_start":${safeStart},` +
+        `"patient_id":${String(patientId)},` +
+        `"appointment_type_id":${String(apptTypeId)},` +
+        `"business_id":${String(businessId)},` +
+        `"practitioner_id":${String(practitionerId)},` +
+        `"notes":${safeNotes}` +
+    '}';
+}
 
 // Mask an email for logs so we can correlate without writing PII.
 function maskEmail(e) {
@@ -225,27 +254,38 @@ async function createClinikoAppointmentFromSession(session) {
         patient_phone,
         notes,
         patient_email,
+        appointment_type_id,
     } = session.metadata || {};
 
     console.log(`Creating Cliniko appointment | ${treatment} | ${appointment_date} ${appointment_time}`);
 
     try {
+        if (!appointment_date || !appointment_time) {
+            throw new Error('appointment_date / appointment_time missing from session metadata');
+        }
+        // Cliniko rejects /individual_appointments without an
+        // appointment_type_id, so bail early to a clinic alert email
+        // instead of producing a half-booking.
+        if (!appointment_type_id || !NUMERIC_ID_RE.test(String(appointment_type_id))) {
+            throw new Error(
+                `appointment_type_id missing or invalid in metadata (got: ${appointment_type_id || 'none'})`
+            );
+        }
+
         const patient = await findOrCreatePatient(patient_name, patient_email || session.customer_email, patient_phone);
         console.log(`Patient ready: id=${patient.id}`);
-
-        if (!appointment_date || !appointment_time) {
-            console.warn('No date/time in metadata — skipping Cliniko appointment creation');
-            return;
-        }
 
         const startTime = `${appointment_date}T${to24h(appointment_time)}:00`;
 
         const appt = await clinikoFetch('/individual_appointments', {
             method: 'POST',
-            body: JSON.stringify({
-                appointment_start: startTime,
-                patient_id: patient.id,
-                notes: notes || '',
+            body: buildClinikoApptBody({
+                apptStart: startTime,
+                patientId: patient.id,
+                apptTypeId: appointment_type_id,
+                businessId: LOSIC_BUSINESS_ID,
+                practitionerId: LOSIC_PRACTITIONER_ID,
+                notes,
             }),
         });
 
@@ -331,6 +371,7 @@ async function sendConfirmationEmails({ name, email, treatment, duration, price,
     // Every interpolated field is HTML-escaped because patient_name and
     // notes are user-controlled (Stripe metadata is just a string store —
     // no schema validation on what we put in).
+    const displayName  = name || 'Patient';
     const safeName     = escapeHtml(name || 'Patient');
     const safeEmail    = escapeHtml(email);
     const safeTreatmt  = escapeHtml(treatment || 'N/A');
@@ -395,12 +436,20 @@ async function sendConfirmationEmails({ name, email, treatment, duration, price,
     const from = process.env.RESEND_FROM || 'LOSIC Bookings <bookings@losic.co.uk>';
 
     const send = async (to, subject, html) => {
+        // Log both attempt and outcome so silent email failures
+        // (Resend domain unverified, key invalid, account paused) are
+        // visible in Vercel logs without needing a debugger attached.
+        console.log(`[email] sending → ${maskEmail(to)} | from=${from} | subject="${subject}"`);
         const r = await fetch('https://api.resend.com/emails', {
             method: 'POST',
             headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({ from, to: [to], subject, html }),
         });
-        if (!r.ok) console.error(`Email to ${to} failed:`, await r.text());
+        if (!r.ok) {
+            console.error(`[email] FAILED → ${maskEmail(to)}:`, await r.text());
+        } else {
+            console.log(`[email] sent ok → ${maskEmail(to)}`);
+        }
     };
 
     // Clinic notification email — goes to the live clinic inbox. The
@@ -416,10 +465,19 @@ async function sendConfirmationEmails({ name, email, treatment, duration, price,
         );
     }
 
-    await Promise.allSettled([
-        email ? send(email, 'Your LOSIC Booking Confirmation', patientHtml) : Promise.resolve(),
-        send(clinicInbox, `New Booking: ${displayName} — ${treatment} on ${formattedDate}`, clinicHtml),
-    ]);
+    // Cliniko already sends its own confirmation email + SMS direct from
+    // the clinic's account when the appointment lands, so we deliberately
+    // do NOT send a second LOSIC-branded email to the patient — two
+    // overlapping confirmations are confusing and look amateur. The
+    // clinic notification still goes out so the front desk has an
+    // immediate heads-up. patientHtml is kept above for the rare manual
+    // re-send case, but is not used on the happy path.
+    void patientHtml;
+    await send(
+        clinicInbox,
+        `New Booking: ${displayName} — ${treatment} on ${formattedDate}`,
+        clinicHtml,
+    );
 }
 
 // ============================================
@@ -430,15 +488,29 @@ app.post('/api/stripe-webhook', async (req, res) => {
     const sig = req.headers['stripe-signature'];
     const secret = process.env.STRIPE_WEBHOOK_SECRET;
 
+    // Loud, specific log when the secret is missing — otherwise the
+    // failure looked identical to a forged request and you couldn't
+    // tell from Vercel logs that Stripe was actually delivering events.
+    if (!secret) {
+        console.error(
+            '[webhook] STRIPE_WEBHOOK_SECRET is NOT SET in Vercel env. ' +
+            'Stripe will keep retrying and emails/Cliniko bookings will ' +
+            'never fire until you add it.'
+        );
+        return res.status(500).send('Server misconfigured');
+    }
+
     let event;
     try {
         event = stripe.webhooks.constructEvent(req.body, sig, secret);
     } catch (err) {
-        console.error('Webhook signature error:', err.message);
+        console.error('[webhook] signature verification failed:', err.message);
         // Stripe sees the 400 and retries; we don't echo the error
         // back over the wire because the body is internet-visible.
         return res.status(400).send('Webhook signature verification failed');
     }
+
+    console.log(`[webhook] received ${event.type} (event ${event.id})`);
 
     if (event.type === 'checkout.session.completed') {
         const session = event.data.object;
@@ -477,6 +549,7 @@ app.post('/api/create-checkout', rateLimit({ windowMs: 60_000, max: 5 }), async 
             patient_name, patient_email, patient_phone,
             notes,
             booking_ref,
+            appointment_type_id,
             success_url: clientSuccessUrl,
             cancel_url:  clientCancelUrl,
         } = req.body;
@@ -486,6 +559,23 @@ app.post('/api/create-checkout', rateLimit({ windowMs: 60_000, max: 5 }), async 
             return res.status(400).json({ error: 'price must be a positive number under £10,000' });
         }
         if (!treatment) return res.status(400).json({ error: 'treatment is required' });
+        if (!patient_email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(patient_email).trim())) {
+            return res.status(400).json({ error: 'A valid email address is required.' });
+        }
+        if (!patient_name || !String(patient_name).trim()) {
+            return res.status(400).json({ error: 'Your name is required.' });
+        }
+        if (!date || !time || !String(date).trim() || !String(time).trim()) {
+            return res.status(400).json({ error: 'Please pick a date and time before paying.' });
+        }
+        // appointment_type_id is required so the webhook can create the
+        // matching Cliniko appointment type. Reject before charging the
+        // card if it's missing or not a positive integer.
+        if (!appointment_type_id || !NUMERIC_ID_RE.test(String(appointment_type_id))) {
+            return res.status(400).json({
+                error: 'This treatment is not bookable online yet. Please call the clinic.',
+            });
+        }
 
         // Cap each metadata field so nobody can stuff garbage into Stripe.
         const m_treatment     = clampStr(treatment,    120);
@@ -497,6 +587,7 @@ app.post('/api/create-checkout', rateLimit({ windowMs: 60_000, max: 5 }), async 
         const m_patient_phone = clampStr(patient_phone, 40);
         const m_notes         = clampStr(notes,        400);
         const m_booking_ref   = clampStr(booking_ref,   40);
+        const m_appt_type_id  = clampStr(appointment_type_id, 24);
 
         // Deep-link return URLs — app passes its own losic:// scheme so the
         // Chrome Custom Tab closes automatically after payment. Allow-list
@@ -531,16 +622,17 @@ app.post('/api/create-checkout', rateLimit({ windowMs: 60_000, max: 5 }), async 
             success_url: successUrl,
             cancel_url: cancelUrl,
             metadata: {
-                treatment:        m_treatment,
-                duration:         m_duration,
-                price:            String(price),
-                appointment_date: m_date,
-                appointment_time: m_time,
-                patient_name:     m_patient_name,
-                patient_email:    m_patient_email,
-                patient_phone:    m_patient_phone,
-                notes:            m_notes,
-                booking_ref:      m_booking_ref,
+                treatment:           m_treatment,
+                duration:            m_duration,
+                price:               String(price),
+                appointment_date:    m_date,
+                appointment_time:    m_time,
+                patient_name:        m_patient_name,
+                patient_email:       m_patient_email,
+                patient_phone:       m_patient_phone,
+                notes:               m_notes,
+                booking_ref:         m_booking_ref,
+                appointment_type_id: m_appt_type_id,
             },
         });
 
@@ -598,25 +690,32 @@ function _formatClinicTime(isoString) {
     return `${hour12}:${minute} ${ampm}`;
 }
 
-app.get('/api/booked-slots', async (req, res) => {
+app.get('/api/booked-slots', rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
     try {
         const { date } = req.query;
         if (!date) return res.status(400).json({ error: 'date is required (YYYY-MM-DD)' });
         if (!DATE_RE.test(String(date))) {
             return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
         }
-        const from = `${date}T00:00:00`;
-        const to   = `${date}T23:59:59`;
+        // Cliniko's GET /individual_appointments uses `starts_at` for the
+        // schedule field, NOT `appointment_start` (that name only exists on
+        // POST /individual_appointments when CREATING a record). Filter
+        // values also need the `Z` UTC suffix — Cliniko silently returns
+        // zero results for naïve datetimes. Without these two corrections
+        // every slot was returned as available, which is why nothing was
+        // greyed out in the app.
+        const from = `${date}T00:00:00Z`;
+        const to   = `${date}T23:59:59Z`;
         const endpoint =
             `/individual_appointments` +
-            `?q[]=${encodeURIComponent('appointment_start:>=' + from)}` +
-            `&q[]=${encodeURIComponent('appointment_start:<=' + to)}` +
+            `?q[]=${encodeURIComponent('starts_at:>=' + from)}` +
+            `&q[]=${encodeURIComponent('starts_at:<=' + to)}` +
             `&per_page=100`;
         const data = await clinikoFetch(endpoint);
         const list = data.individual_appointments || [];
         const booked = list
             .filter((a) => !a.cancelled_at && !a.did_not_arrive)
-            .map((a) => _formatClinicTime(a.appointment_start));
+            .map((a) => _formatClinicTime(a.starts_at));
         res.json({ booked: Array.from(new Set(booked)) });
     } catch (error) {
         console.error('booked-slots error:', error.message);
@@ -625,23 +724,11 @@ app.get('/api/booked-slots', async (req, res) => {
 });
 
 // ============================================
-// CLINIKO — GET APPOINTMENT TYPES
-// ============================================
-
-app.get('/api/appointment-types', async (req, res) => {
-    try {
-        const data = await clinikoFetch('/appointment_types');
-        res.json(data.appointment_types || []);
-    } catch (error) {
-        return safeError(res, 'appointment-types', error);
-    }
-});
-
-// ============================================
 // CLINIKO — GET AVAILABLE TIMES
 // ============================================
+// Rate-limited so a bot can't hammer Cliniko's request quota through us.
 
-app.get('/api/available-times', async (req, res) => {
+app.get('/api/available-times', rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
     try {
         const { date, appointment_type_id, practitioner_id } = req.query;
         if (!date) return res.status(400).json({ error: 'date is required' });
@@ -687,19 +774,6 @@ app.get('/api/config', (req, res) => {
             clinicEmailConfigured: Boolean(process.env.CLINIC_EMAIL),
         },
     });
-});
-
-// ============================================
-// PRACTITIONERS
-// ============================================
-
-app.get('/api/practitioners', async (req, res) => {
-    try {
-        const data = await clinikoFetch('/practitioners');
-        res.json(data.practitioners || []);
-    } catch (error) {
-        return safeError(res, 'practitioners', error);
-    }
 });
 
 // ============================================
