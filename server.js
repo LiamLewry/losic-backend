@@ -210,6 +210,36 @@ function to24h(time12) {
     return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
 }
 
+// Returns true if Cliniko already has a non-cancelled appointment for
+// our practitioner at the exact start time. Used as a pre-flight check
+// in the webhook so a paid booking that lands on an already-taken slot
+// triggers the rebook + auto-refund flow instead of a silent
+// double-booking. `time12h` is the same "9:00 AM"-style string the
+// front-end posts in metadata, matched against the formatted Cliniko
+// timestamps so we don't have to juggle timezones manually.
+async function isSlotAlreadyBooked(date, time12h, practitionerId = LOSIC_PRACTITIONER_ID) {
+    const from = `${date}T00:00:00Z`;
+    const to   = `${date}T23:59:59Z`;
+    const endpoint =
+        `/individual_appointments` +
+        `?q[]=${encodeURIComponent('starts_at:>=' + from)}` +
+        `&q[]=${encodeURIComponent('starts_at:<=' + to)}` +
+        `&per_page=100`;
+    const data = await clinikoFetch(endpoint);
+    const list = data.individual_appointments || [];
+    return list.some((a) => {
+        if (a.cancelled_at) return false;
+        if (a.did_not_arrive) return false;
+        // Cliniko sometimes returns practitioner as a numeric id and
+        // sometimes as a sub-object — handle both.
+        const apptPractId = String(a.practitioner_id ?? a.practitioner?.id ?? '');
+        if (practitionerId && apptPractId && apptPractId !== String(practitionerId)) {
+            return false;
+        }
+        return _formatClinicTime(a.starts_at) === time12h;
+    });
+}
+
 // ============================================
 // CREATE OR FIND CLINIKO PATIENT
 // ============================================
@@ -270,6 +300,26 @@ async function createClinikoAppointmentFromSession(session) {
             throw new Error(
                 `appointment_type_id missing or invalid in metadata (got: ${appointment_type_id || 'none'})`
             );
+        }
+
+        // Pre-flight conflict check. If two patients race for the same
+        // slot, the second one's webhook lands here AFTER the first
+        // booking is already in Cliniko. Detect it and trigger the
+        // refund + rebook-email flow instead of silently double-booking.
+        // Failure of the check itself is non-fatal: we log and proceed
+        // so a transient Cliniko hiccup doesn't block real bookings.
+        try {
+            const conflict = await isSlotAlreadyBooked(appointment_date, appointment_time);
+            if (conflict) {
+                console.warn(
+                    `[webhook] DOUBLE-BOOKING detected for ${appointment_date} ${appointment_time}` +
+                    ` — refunding session ${session.id}`
+                );
+                await handleRebookFlow(session, 'slot already taken in Cliniko');
+                return null; // signals: appointment NOT created — skip confirmation email
+            }
+        } catch (preErr) {
+            console.error('[webhook] conflict pre-check failed (continuing):', preErr.message);
         }
 
         const patient = await findOrCreatePatient(patient_name, patient_email || session.customer_email, patient_phone);
@@ -355,6 +405,130 @@ async function sendClinicAlert({ subject, reason, error, session }) {
     } else {
         console.log(`Clinic alert email sent → ${maskEmail(clinicInbox)}`);
     }
+}
+
+// ============================================
+// REBOOK FLOW — auto-refund + patient email + clinic alert
+// ============================================
+// Fires when a paid Stripe session can't actually be booked into Cliniko
+// (typically because two patients picked the same slot in the same race
+// window). Refund is idempotency-keyed so a Stripe webhook retry is
+// safe; emails are best-effort and logged on failure.
+
+async function refundCheckoutSession(session) {
+    if (!session?.payment_intent) {
+        throw new Error('Cannot refund — Stripe session has no payment_intent');
+    }
+    return stripe.refunds.create(
+        { payment_intent: session.payment_intent },
+        { idempotencyKey: `rebook_refund_${session.id}` },
+    );
+}
+
+async function sendPatientRebookEmail({ name, email, treatment, date, time, price, bookingRef }) {
+    const key = process.env.RESEND_API_KEY;
+    if (!key || key === 're_your_resend_api_key_here') {
+        console.warn('RESEND_API_KEY not set — cannot send patient rebook email');
+        return;
+    }
+    if (!email) {
+        console.warn('[rebook-email] no patient email on session — cannot notify patient');
+        return;
+    }
+    const safeName    = escapeHtml(name || 'Patient');
+    const safeTreatmt = escapeHtml(treatment || 'your appointment');
+    const safeTime    = escapeHtml(time || 'TBC');
+    const safePrice   = escapeHtml(price != null ? String(price) : '');
+    const safeRef     = bookingRef ? escapeHtml(bookingRef) : '';
+    const formattedDate = date
+        ? new Date(date).toLocaleDateString('en-GB', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+        : 'TBC';
+
+    const html = `
+<div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px;">
+  <h1 style="color:#248B9A;margin:0 0 4px;">LOSIC Clinic</h1>
+  <p style="color:#6b7280;margin:0 0 20px;">Luton Osteopathic &amp; Sports Injury Clinic</p>
+  <h2 style="color:#b91c1c;margin-top:0;">Sorry — that slot was just taken</h2>
+  <p>Dear ${safeName},</p>
+  <p>You tried to book <strong>${safeTreatmt}</strong> on <strong>${formattedDate}</strong> at <strong>${safeTime}</strong>, but unfortunately another patient booked the same slot at the same time.</p>
+  <div style="background:#ECF3F4;border:1px solid #45B5C6;border-radius:8px;padding:16px;margin:20px 0;">
+    <h3 style="margin:0 0 8px;color:#175A64;">✓ Your money has been refunded automatically</h3>
+    <p style="margin:0;color:#175A64;">A full refund${safePrice ? ' of <strong>£' + safePrice + '</strong>' : ''} has been sent back to your card. It usually arrives within 5&ndash;10 working days, depending on your bank.</p>
+  </div>
+  <p>To pick a different time, please open the LOSIC app and book again. We're sorry for the inconvenience.</p>
+  ${safeRef ? `<p style="color:#6b7280;font-size:13px;">Original booking reference: <strong>${safeRef}</strong></p>` : ''}
+  <div style="background:#f9fafb;border-radius:8px;padding:14px;margin:20px 0;">
+    <p style="margin:0;font-size:14px;color:#374151;">Need help? <a href="mailto:lutonosteo@gmail.com" style="color:#248B9A;">lutonosteo@gmail.com</a> · <a href="tel:01582575045" style="color:#248B9A;">01582 575 045</a></p>
+  </div>
+</div>`;
+
+    const from = process.env.RESEND_FROM || 'LOSIC Bookings <bookings@losic.co.uk>';
+    console.log(`[rebook-email] sending → ${maskEmail(email)} | from=${from}`);
+    const r = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            from,
+            to: [email],
+            subject: 'Booking unavailable — refund processed · LOSIC Clinic',
+            html,
+        }),
+    });
+    if (!r.ok) {
+        console.error(`[rebook-email] FAILED → ${maskEmail(email)}:`, await r.text());
+    } else {
+        console.log(`[rebook-email] sent ok → ${maskEmail(email)}`);
+    }
+}
+
+// Shared rebook flow used by both the webhook (automatic, on slot
+// conflict) and the /api/rebook-email endpoint (manual). Refunds the
+// Stripe charge, emails the patient, and alerts the clinic. Each step
+// is wrapped in try/catch so one failure doesn't suppress the others.
+async function handleRebookFlow(session, reason = 'slot already taken') {
+    const m = session.metadata || {};
+    const patientEmail = m.patient_email || session.customer_email;
+    const patientName  = m.patient_name;
+    const treatment    = m.treatment;
+    const date         = m.appointment_date;
+    const time         = m.appointment_time;
+    const price        = m.price;
+    const bookingRef   = m.booking_ref;
+
+    console.log(`[rebook] triggered for session=${session.id} reason="${reason}"`);
+
+    let refundOk = false;
+    try {
+        const refund = await refundCheckoutSession(session);
+        refundOk = refund?.status === 'succeeded' || refund?.status === 'pending';
+        console.log(`[rebook] refund ${refund?.id} status=${refund?.status}`);
+    } catch (err) {
+        console.error(`[rebook] refund FAILED: ${err.message}`);
+    }
+
+    try {
+        await sendPatientRebookEmail({
+            name: patientName,
+            email: patientEmail,
+            treatment, date, time, price,
+            bookingRef,
+        });
+    } catch (err) {
+        console.error(`[rebook] patient email FAILED: ${err.message}`);
+    }
+
+    try {
+        await sendClinicAlert({
+            subject: `⚠ Double-booking — auto-refunded ${patientName || 'patient'} (${treatment || 'unknown treatment'})`,
+            reason: `${reason}. Patient was auto-refunded and emailed to rebook.`,
+            error: refundOk ? 'Refund OK' : 'Refund attempt FAILED — manual refund may be required.',
+            session,
+        });
+    } catch (err) {
+        console.error(`[rebook] clinic alert FAILED: ${err.message}`);
+    }
+
+    return { refundOk };
 }
 
 // ============================================
@@ -465,14 +639,20 @@ async function sendConfirmationEmails({ name, email, treatment, duration, price,
         );
     }
 
-    // Cliniko already sends its own confirmation email + SMS direct from
-    // the clinic's account when the appointment lands, so we deliberately
-    // do NOT send a second LOSIC-branded email to the patient — two
-    // overlapping confirmations are confusing and look amateur. The
-    // clinic notification still goes out so the front desk has an
-    // immediate heads-up. patientHtml is kept above for the rare manual
-    // re-send case, but is not used on the happy path.
-    void patientHtml;
+    // Both the patient and the clinic get a LOSIC-branded confirmation.
+    // Cliniko itself also sends its own confirmation/SMS to the patient,
+    // but having a clear branded email from the booking app gives the
+    // patient an immediate "yes — your money was taken and the booking
+    // is confirmed" receipt independent of Cliniko's queue.
+    if (email) {
+        await send(
+            email,
+            `Booking Confirmed — ${treatment} on ${formattedDate} · LOSIC Clinic`,
+            patientHtml,
+        );
+    } else {
+        console.warn('[email] no patient email available — skipping patient confirmation');
+    }
     await send(
         clinicInbox,
         `New Booking: ${displayName} — ${treatment} on ${formattedDate}`,
@@ -516,25 +696,66 @@ app.post('/api/stripe-webhook', async (req, res) => {
         const session = event.data.object;
         console.log('Payment succeeded — session:', session.id);
 
-        // Create Cliniko appointment
-        await createClinikoAppointmentFromSession(session);
+        // Create Cliniko appointment. Returns null if a rebook flow
+        // fired (double-booking → patient was auto-refunded + emailed)
+        // so we skip the standard confirmation email below.
+        const result = await createClinikoAppointmentFromSession(session);
 
-        // Send confirmation emails
-        const m = session.metadata || {};
-        await sendConfirmationEmails({
-            name: m.patient_name,
-            email: m.patient_email || session.customer_email,
-            treatment: m.treatment,
-            duration: m.duration,
-            price: m.price,
-            date: m.appointment_date,
-            time: m.appointment_time,
-            notes: m.notes,
-            bookingRef: m.booking_ref,
-        });
+        if (result === null) {
+            console.log(`[webhook] rebook flow handled session=${session.id} — skipping confirmation email`);
+        } else {
+            const m = session.metadata || {};
+            await sendConfirmationEmails({
+                name: m.patient_name,
+                email: m.patient_email || session.customer_email,
+                treatment: m.treatment,
+                duration: m.duration,
+                price: m.price,
+                date: m.appointment_date,
+                time: m.appointment_time,
+                notes: m.notes,
+                bookingRef: m.booking_ref,
+            });
+        }
     }
 
     res.json({ received: true });
+});
+
+// ============================================
+// /api/rebook-email — manual refund + rebook trigger
+// ============================================
+// Same flow the webhook fires automatically on a double-booking, but
+// exposed as a POST endpoint so the clinic can manually rebook a
+// patient (e.g. if a slot has to be cancelled by the practitioner
+// after payment). Body: { session_id: "cs_test_..." }.
+//
+// Optional bearer-token gate: if ADMIN_TOKEN is set in Vercel env, the
+// caller must send `Authorization: Bearer <token>`. If the env var is
+// not set, the endpoint relies on rate limiting + the unguessability of
+// Stripe session IDs, matching the security posture of the other
+// admin-adjacent endpoints in this file.
+app.post('/api/rebook-email', rateLimit({ windowMs: 60_000, max: 10 }), async (req, res) => {
+    try {
+        const adminToken = process.env.ADMIN_TOKEN;
+        if (adminToken) {
+            const provided = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+            if (provided !== adminToken) {
+                return res.status(401).json({ error: 'unauthorized' });
+            }
+        }
+
+        const { session_id } = req.body || {};
+        if (!session_id || !/^cs_(test|live)_[A-Za-z0-9]{1,200}$/.test(String(session_id))) {
+            return res.status(400).json({ error: 'session_id is required and must be a Stripe checkout session id' });
+        }
+
+        const session = await stripe.checkout.sessions.retrieve(session_id);
+        const { refundOk } = await handleRebookFlow(session, 'manual rebook trigger');
+        res.json({ ok: true, refundOk });
+    } catch (error) {
+        return safeError(res, 'rebook-email', error);
+    }
 });
 
 // ============================================
